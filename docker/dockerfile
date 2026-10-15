@@ -11,6 +11,7 @@ FROM louislam/uptime-kuma:builder-go3 AS build_healthcheck
 # Build in Node.js
 ############################################
 FROM louislam/uptime-kuma:base3 AS build
+RUN mkdir -p /app && chown node:node /app
 USER node
 WORKDIR /app
 
@@ -46,6 +47,7 @@ CMD ["node", "--import=tsx", "server/server.js"]
 # Rootless Image
 ############################################
 FROM release AS rootless
+RUN mkdir -p /app && chown node:node /app
 USER node
 
 ############################################
@@ -55,6 +57,7 @@ FROM release AS nightly
 RUN npm run mark-as-nightly
 
 FROM nightly AS nightly-rootless
+RUN mkdir -p /app && chown node:node /app
 USER node
 
 ############################################
@@ -76,6 +79,7 @@ RUN apt update \
 ## Empty the directory, because we have to clone the Git repo.
 RUN rm -rf ./* && chown node /app
 
+RUN mkdir -p /app && chown node:node /app
 USER node
 RUN git config --global user.email "no-reply@no-reply.com"
 RUN git config --global user.name "PR Tester"
