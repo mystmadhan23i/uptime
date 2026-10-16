@@ -1,3 +1,4 @@
+
 pipeline {
     agent any
 
@@ -6,13 +7,18 @@ pipeline {
         REMOTE_HOST = 'ubuntu@172.31.19.216'
         SSH_KEY = '/var/lib/jenkins/.ssh/id_ed25519'
         REMOTE_TAR = '/home/ubuntu/uptime-kuma-dev.tar'
+        CONTAINER_NAME = 'uptime-kuma'
     }
 
     stages {
         stage('Checkout / Verify') {
             steps {
-                sh 'pwd'
-                sh 'ls -l'
+                sh '''
+                    echo "Checking source code..."
+                    pwd
+                    ls -la
+                    test -f docker/dockerfile
+                '''
             }
         }
 
@@ -27,16 +33,17 @@ pipeline {
             }
         }
 
-        stage('Export Image') {
+        stage('Export Docker Image') {
             steps {
                 sh '''
                     docker save ${IMAGE_NAME} -o /tmp/uptime-kuma-dev.tar
                     chmod 644 /tmp/uptime-kuma-dev.tar
+                    ls -lh /tmp/uptime-kuma-dev.tar
                 '''
             }
         }
 
-        stage('Copy Image to Gaint') {
+        stage('Transfer Image to Gaint') {
             steps {
                 sh '''
                     scp \
@@ -57,33 +64,49 @@ pipeline {
                       -o IdentitiesOnly=yes \
                       -o StrictHostKeyChecking=accept-new \
                       ${REMOTE_HOST} 'bash -s' <<'REMOTE_SCRIPT'
-set -e
+set -eu
 
+echo "Loading Docker image..."
 sudo docker load -i /home/ubuntu/uptime-kuma-dev.tar
 
-# Preserve existing application data volume.
-sudo docker stop uptime-kuma || true
-sudo docker rm uptime-kuma || true
+echo "Removing old container if it exists..."
+sudo docker rm -f uptime-kuma 2>/dev/null || true
 
+echo "Starting new container..."
+sudo docker run -d \
+  --name uptime-kuma \
+  --restart unless-stopped \
+  -p 3001:3001 \
+  -v uptime-kuma-data:/app/data \
+  uptime-kuma:dev
 
-sudo docker run -d --name uptime-kuma --restart unless-stopped -p 3001:3001 -v uptime-kuma-data:/app/data uptime-kuma:dev
+echo "Waiting for application startup..."
+sleep 15
 
+if ! sudo docker inspect uptime-kuma >/dev/null 2>&1; then
+    echo "ERROR: Container was not created."
+    exit 1
+fi
 
-# Wait for the application to become healthy.
-for i in $(seq 1 30); do
-    STATUS=$(sudo docker inspect 
-      --format='{{.State.Health.Status}}' uptime-kuma 2>/dev/null || true)
+if [ "$(sudo docker inspect -f '{{.State.Running}}' uptime-kuma)" != "true" ]; then
+    echo "ERROR: Container is not running."
+    sudo docker logs --tail 100 uptime-kuma
+    exit 1
+fi
 
-    if [ "$STATUS" = "healthy" ]; then
-        echo "Uptime Kuma is healthy."
-        sudo docker ps --filter name=uptime-kuma
+echo "Container is running."
+sudo docker ps --filter name=uptime-kuma
+
+echo "Checking application response..."
+for i in $(seq 1 12); do
+    if curl -fsS http://127.0.0.1:3001/ >/dev/null; then
+        echo "SUCCESS: Uptime Kuma is responding on port 3001."
         exit 0
     fi
-
-    sleep 10
+    sleep 5
 done
 
-echo "Health check timed out. Container logs:"
+echo "ERROR: Application did not respond on port 3001."
 sudo docker logs --tail 100 uptime-kuma
 exit 1
 REMOTE_SCRIPT
@@ -97,10 +120,11 @@ REMOTE_SCRIPT
             sh 'rm -f /tmp/uptime-kuma-dev.tar'
         }
         success {
-            echo 'Deployment completed successfully!'
+            echo 'SUCCESS: Uptime Kuma built and deployed on Gaint!'
         }
         failure {
-            echo 'Pipeline failed. Check the stage logs.'
+            echo 'FAILED: Check the stage logs in Console Output.'
         }
     }
 }
+
