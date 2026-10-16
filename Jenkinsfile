@@ -22,6 +22,18 @@ pipeline {
             }
         }
 
+        
+        stage('Build Frontend') {
+            steps {
+                sh '''
+                    npm ci
+                    npm run build
+                    test -f dist/index.html
+                '''
+            }
+        }
+
+
         stage('Build Docker Image') {
             steps {
                 sh '''
