@@ -1,46 +1,79 @@
 
+
 pipeline {
     agent any
 
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 90, unit: 'MINUTES')
+    }
+
     environment {
         IMAGE_NAME = 'uptime-kuma:dev'
-        REMOTE_HOST = 'ubuntu@172.31.19.216'
-        SSH_KEY = '/var/lib/jenkins/.ssh/id_ed25519'
-        REMOTE_TAR = '/home/ubuntu/uptime-kuma-dev.tar'
-        CONTAINER_NAME = 'uptime-kuma'
+        GAIN_HOST  = '172.31.19.216'
+        GAIN_USER  = 'ubuntu'
+        SSH_KEY    = '/var/lib/jenkins/.ssh/id_ed25519'
+        TAR_FILE   = "${WORKSPACE}/uptime-kuma-dev.tar"
     }
 
     stages {
         stage('Checkout / Verify') {
             steps {
                 sh '''
+                    set -eu
                     echo "Checking source code..."
-                    pwd
-                    ls -la
                     test -f docker/dockerfile
+                    test -f package.json
+                    test -f package-lock.json
+                    test -f Jenkinsfile
+                    echo "Source files verified."
                 '''
             }
         }
 
-        
         stage('Build Frontend') {
             steps {
                 sh '''
-                    npm ci
-                    npm run build
-                    test -f dist/index.html
+                    set -eu
+
+                    echo "Installing frontend dependencies in Docker..."
+                    docker run --rm \
+                      -v "$WORKSPACE:/app" \
+                      -w /app \
+                      --entrypoint npm \
+                      louislam/uptime-kuma:base3 ci
+
+                    echo "Building frontend..."
+                    docker run --rm \
+                      -v "$WORKSPACE:/app" \
+                      -w /app \
+                      --entrypoint npm \
+                      louislam/uptime-kuma:base3 run build
+
+                    test -s "$WORKSPACE/dist/index.html"
+                    echo "Frontend build verified."
                 '''
             }
         }
-
 
         stage('Build Docker Image') {
             steps {
                 sh '''
+                    set -eu
+
                     docker build \
                       --target release \
                       -f docker/dockerfile \
-                      -t ${IMAGE_NAME} .
+                      -t "$IMAGE_NAME" .
+
+                    echo "Verifying frontend exists inside the image..."
+                    docker run --rm \
+                      --entrypoint sh \
+                      "$IMAGE_NAME" \
+                      -c 'test -s /app/dist/index.html'
+
+                    echo "Docker image verified."
                 '''
             }
         }
@@ -48,9 +81,11 @@ pipeline {
         stage('Export Docker Image') {
             steps {
                 sh '''
-                    docker save ${IMAGE_NAME} -o /tmp/uptime-kuma-dev.tar
-                    chmod 644 /tmp/uptime-kuma-dev.tar
-                    ls -lh /tmp/uptime-kuma-dev.tar
+                    set -eu
+                    rm -f "$TAR_FILE"
+                    docker save "$IMAGE_NAME" -o "$TAR_FILE"
+                    test -s "$TAR_FILE"
+                    ls -lh "$TAR_FILE"
                 '''
             }
         }
@@ -58,12 +93,22 @@ pipeline {
         stage('Transfer Image to Gaint') {
             steps {
                 sh '''
-                    scp \
-                      -i ${SSH_KEY} \
+                    set -eu
+                    chmod 600 "$SSH_KEY"
+
+                    ssh -i "$SSH_KEY" \
                       -o IdentitiesOnly=yes \
                       -o StrictHostKeyChecking=accept-new \
-                      /tmp/uptime-kuma-dev.tar \
-                      ${REMOTE_HOST}:${REMOTE_TAR}
+                      "$GAIN_USER@$GAIN_HOST" \
+                      'mkdir -p /home/ubuntu/uptime-deploy'
+
+                    scp -i "$SSH_KEY" \
+                      -o IdentitiesOnly=yes \
+                      -o StrictHostKeyChecking=accept-new \
+                      "$TAR_FILE" \
+                      "$GAIN_USER@$GAIN_HOST:/home/ubuntu/uptime-deploy/uptime-kuma-dev.tar"
+
+                    echo "Image transferred."
                 '''
             }
         }
@@ -71,72 +116,96 @@ pipeline {
         stage('Deploy on Gaint') {
             steps {
                 sh '''
-                    ssh \
-                      -i ${SSH_KEY} \
+                    set -eu
+
+                    ssh -i "$SSH_KEY" \
                       -o IdentitiesOnly=yes \
                       -o StrictHostKeyChecking=accept-new \
-                      ${REMOTE_HOST} 'bash -s' <<'REMOTE_SCRIPT'
+                      "$GAIN_USER@$GAIN_HOST" 'bash -s' <<'REMOTE'
 set -eu
 
+IMAGE_TAR="/home/ubuntu/uptime-deploy/uptime-kuma-dev.tar"
+
 echo "Loading Docker image..."
-sudo docker load -i /home/ubuntu/uptime-kuma-dev.tar
+sudo docker load -i "$IMAGE_TAR"
 
-echo "Removing old container if it exists..."
-sudo docker rm -f uptime-kuma 2>/dev/null || true
+echo "Ensuring persistent data volume exists..."
+sudo docker volume create uptime-kuma-data >/dev/null
 
-echo "Starting new container..."
+echo "Preserving the existing /app/data volume if one is attached..."
+DATA_VOLUME="uptime-kuma-data"
+
+if sudo docker container inspect uptime-kuma >/dev/null 2>&1; then
+    EXISTING_VOLUME=$(sudo docker inspect \
+      --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Name}}{{end}}{{end}}' \
+      uptime-kuma)
+
+    if [ -n "$EXISTING_VOLUME" ]; then
+        DATA_VOLUME="$EXISTING_VOLUME"
+        echo "Using existing data volume: $DATA_VOLUME"
+    fi
+
+    echo "Stopping old container..."
+    sudo docker stop uptime-kuma || true
+    sudo docker rm uptime-kuma
+fi
+
+echo "Starting updated container..."
 sudo docker run -d \
   --name uptime-kuma \
   --restart unless-stopped \
   -p 3001:3001 \
-  -v uptime-kuma-data:/app/data \
+  -v "$DATA_VOLUME:/app/data" \
   uptime-kuma:dev
 
-echo "Waiting for application startup..."
-sleep 15
+echo "Waiting for the application to start..."
+READY=0
 
-if ! sudo docker inspect uptime-kuma >/dev/null 2>&1; then
-    echo "ERROR: Container was not created."
-    exit 1
-fi
+for i in $(seq 1 36); do
+    if sudo docker exec uptime-kuma \
+        node -e "fetch('http://127.0.0.1:3001/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+    then
+        READY=1
+        break
+    fi
 
-if [ "$(sudo docker inspect -f '{{.State.Running}}' uptime-kuma)" != "true" ]; then
-    echo "ERROR: Container is not running."
+    if ! sudo docker inspect \
+        --format '{{.State.Running}}' uptime-kuma | grep -q true; then
+        echo "Container stopped unexpectedly."
+        sudo docker logs --tail 100 uptime-kuma
+        exit 1
+    fi
+
+    sleep 5
+done
+
+if [ "$READY" -ne 1 ]; then
+    echo "Application did not become ready."
     sudo docker logs --tail 100 uptime-kuma
     exit 1
 fi
 
-echo "Container is running."
+echo "Deployment verified."
 sudo docker ps --filter name=uptime-kuma
-
-echo "Checking application response..."
-for i in $(seq 1 12); do
-    if curl -fsS http://127.0.0.1:3001/ >/dev/null; then
-        echo "SUCCESS: Uptime Kuma is responding on port 3001."
-        exit 0
-    fi
-    sleep 5
-done
-
-echo "ERROR: Application did not respond on port 3001."
-sudo docker logs --tail 100 uptime-kuma
-exit 1
-REMOTE_SCRIPT
+REMOTE
                 '''
             }
         }
     }
 
     post {
-        always {
-            sh 'rm -f /tmp/uptime-kuma-dev.tar'
-        }
         success {
-            echo 'SUCCESS: Uptime Kuma built and deployed on Gaint!'
+            echo 'SUCCESS: Image built, transferred, deployed, and HTTP readiness verified.'
         }
+
         failure {
-            echo 'FAILED: Check the stage logs in Console Output.'
+            echo 'FAILED: Check the first failing stage in Console Output.'
+        }
+
+        always {
+            sh 'rm -f "$TAR_FILE"'
         }
     }
 }
+
 
