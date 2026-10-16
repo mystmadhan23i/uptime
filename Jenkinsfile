@@ -65,12 +65,9 @@ sudo docker load -i /home/ubuntu/uptime-kuma-dev.tar
 sudo docker stop uptime-kuma || true
 sudo docker rm uptime-kuma || true
 
-sudo docker run -d 
-  --name uptime-kuma 
-  --restart unless-stopped 
-  -p 3001:3001 
-  -v uptime-kuma-data:/app/data 
-  uptime-kuma:dev
+
+sudo docker run -d --name uptime-kuma --restart unless-stopped -p 3001:3001 -v uptime-kuma-data:/app/data uptime-kuma:dev
+
 
 # Wait for the application to become healthy.
 for i in $(seq 1 30); do
